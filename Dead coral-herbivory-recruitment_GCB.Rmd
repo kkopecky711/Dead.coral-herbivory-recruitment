@@ -1,0 +1,807 @@
+---
+title: "Effects of dead skeletons on herbivory and recruitment"
+author: "Kai Kopecky"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Packages}
+library(tidyverse)
+library(janitor)
+library(car)
+library(glmmTMB)
+library(lme4)
+library(ggeffects)
+library(rstatix)
+library(emmeans)
+```
+
+## Grazing scars
+```{r Data loading and statistics}
+
+# Load data
+scars <- read_csv("Data/Grazing scar data for statistical analyses.csv") %>% 
+  clean_names() %>% 
+  mutate(gap_distance_cm = as.factor(gap_distance_cm))
+
+## Successive one-tailed t-tests against the "open" mean (10cm) with bonferroni correction to adust p-values for multiple tests
+
+# Define population mean and alternative hypothesis
+population_mean <- 10
+alternative <- "less"  # One-tailed test to see if the mean is less than the population mean
+
+# Function to run one-tailed t-tests and apply Bonferroni correction
+run_t_tests_with_bonferroni <- function(scars, gap_size_col, bites_col, population_mean, alternative) {
+  results <- scars %>%
+    group_by(!!sym(gap_size_col)) %>%
+    summarise(
+      t_test = list(t.test(!!sym(bites_col), mu = population_mean, alternative = alternative)),
+      p_value = t_test[[1]]$p.value
+    )
+  
+  # Apply Bonferroni correction
+  num_tests <- nrow(results)
+  results <- results %>%
+    mutate(
+      bonferroni_corrected_p = p.adjust(p_value, method = "bonferroni", n = num_tests)
+    )
+  
+  return(results)
+}
+
+# Run the tests
+test_results <- run_t_tests_with_bonferroni(scars, "gap_distance_cm", "bites_per_25_cm2", population_mean, alternative)
+
+# Print results
+print(test_results)
+
+```
+
+## Herbivory assays
+### Turf
+```{r Data loading, cleaning, and statistics}
+turf <- read_csv("Data/Turf assays.csv") %>% 
+  clean_names() %>% 
+  filter(elapsed_time == "24 h",
+         percent_turf_remaining != "ND") %>% 
+  mutate(percent_turf_remaining = as.numeric(percent_turf_remaining),
+         percent_turf_removed = 100 - percent_turf_remaining,
+         prop_turf_removed = percent_turf_removed/100,
+         assay_number = as.factor(assay_number))
+
+# Calculate tray means with replicates
+turf.summary <- turf %>% 
+  group_by(ttt, mrb_bommie_number) %>% 
+  summarize(mean_removal = mean(prop_turf_removed)) %>% 
+  mutate(mean_removal.asin = asin(sqrt(mean_removal)),# Arc-sin square-root transformation to improve normality of data
+         ttt = as.factor(ttt)) 
+
+# Welch's t-test of turf removal as a function of structure treatment
+turf.t_test <- t.test(data = turf.summary, mean_removal.asin ~ ttt)
+
+```
+
+### Macroalgae
+```{r Data cleaning and wrangling}
+# Load raw data
+algal_weights.raw <- read_csv("Data/Herbivory assays data_master.csv") %>% 
+  clean_names()
+
+# Create columns for proportional change in mass and palatability
+algal_weights.prop <- algal_weights.raw %>% 
+  mutate(mass_change_raw = final_mass_g - initial_mass_g,
+         mass_change_prop = mass_change_raw/initial_mass_g,
+         # raw_removal = (mass_change_raw*(-1) + 0.2), # converts mass change to proportion removed (*(-1)), then adds a constant for log transformation later (so as to not take a log of a negative value)
+         prop_removal = mass_change_prop*(-1)) %>% 
+  select(-notes) %>% 
+  mutate(preference = case_when(taxa == "Amansia" ~ "More preferred",
+                                  taxa == "Sargassum" ~ "More preferred",
+                                  taxa == "Padina" ~ "More preferred",
+                                  taxa == "Dictyota" ~ "Less preferred",
+                                  taxa == "Turbinaria" ~ "Less preferred",
+                                  taxa == "Lobophora" ~ "Less preferred"),
+         pair = case_when(plot == "1A" ~ "A",
+                          plot == "2A" ~ "A",
+                          plot == "1B" ~ "B",
+                          plot == "2B" ~ "B",
+                          plot == "1C" ~ "C",
+                          plot == "2C" ~ "C",
+                          TRUE ~ "D"),
+         treatment = case_when(treatment == "Dead Coral" ~ "Dead coral",
+                               treatment == "Dead coral" ~ "Dead coral",
+                               treatment == "Open" ~ "Open"),
+         prop_removal = if_else(prop_removal <= 0, 0.0000001, prop_removal))
+
+# To extract effect size to report in-text
+effect_size <- algal_weights.prop %>% 
+  group_by(treatment, preference) %>% 
+  summarize(mean_prop = mean(prop_removal))
+
+```
+
+```{r Statistics for macroalgae}
+
+## Log-difference in removal
+# Calculate relative differences for each pair of assays
+algal_weights.relat_diff <- algal_weights.prop %>% 
+  select(-initial_mass_g, -mass_change_prop, -mass_change_raw, -final_mass_g, -pair) %>% 
+  mutate(plot = case_when(plot == "1A" ~ "A",
+                          plot == "2A" ~ "A",
+                          plot == "1B" ~ "B",
+                          plot == "2B" ~ "B",
+                          plot == "1C" ~ "C",
+                          plot == "2C" ~ "C",
+                          plot == "1D" ~ "D",
+                          plot == "2D" ~ "D")) %>% 
+  pivot_wider(names_from = treatment,
+              values_from = prop_removal) %>%
+  clean_names() %>% 
+  mutate(log.relat_diff = log(dead_coral) - log(open))
+
+# Nested ANOVA of relative difference in each assay pair ~ preference, with taxa nested in preference category
+nested <- aov(log.relat_diff ~ preference / taxa, data = algal_weights.relat_diff)
+summary(nested)
+
+```
+
+#### Combined figure for macroalgae and turf removal
+```{r}
+# Combine datasets
+turf_removal <- turf.summary %>% 
+  select(ttt, mean_removal, mrb_bommie_number) %>% 
+  rename(treatment = ttt,
+         prop_removal = mean_removal,
+         plot = mrb_bommie_number) %>% 
+  mutate(algae_type = "Turf",
+         plot = as.factor(plot)) 
+
+macro_removal <- algal_weights.prop %>% 
+  select(treatment, prop_removal, preference, plot) %>% 
+  rename(algae_type = preference)
+
+removal_combined <- rbind(turf_removal, macro_removal)
+
+# Create summary table of mean removal ~ algae type and structure treatment
+removal.summary <- removal_combined %>% 
+  group_by(treatment, algae_type) %>% 
+  summarize(mean_removal = mean(prop_removal),
+            SE = sd(prop_removal)/sqrt(n()))
+
+# Plot mean removal ~ algae type and structure treatment
+ggplot(removal.summary, aes(x = algae_type, y = mean_removal, fill = treatment)) +
+  geom_col(position = "dodge", 
+           width = 0.5,
+           color = "black") +
+  coord_fixed(ratio = 2) +
+  geom_errorbar(aes(ymax = mean_removal + SE,
+                    ymin = mean_removal - SE),
+                position = position_dodge(width = 0.5),
+                width = 0.1) +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0, 1.1)) +
+  labs(x = "",
+       y = "Proportion of algae removed") +
+  scale_fill_manual(values = c("#746455", "#b9d5eb"),
+                    name = "Structure treatment",
+                    labels = c("Dead skeleton", "Open")) +
+  theme_classic(base_size = 12)
+```
+
+## Algae accummulation
+```{r Algae data wrangling and cleaning}
+
+algae_raw <- read_csv("Data/Algae-cover_master.csv") 
+
+algae_totals <- algae_raw %>%
+  clean_names() %>% 
+  filter(treatment %in% c("Dead coral", "Open")) %>% 
+  mutate(bommie_number = as.factor(bommie_number),
+         total_macroalgae.prop = total_macroalgae/100)
+  
+```
+
+```{r Time series of algae accumulation}
+
+# Summary of algae cover by replicate and treatment (at experiment termination)
+algae_summary <- algae_totals %>% 
+  group_by(treatment, days_since_start) %>% 
+  summarize(mean_algae_cover = mean(total_macroalgae),
+            se_algae_cover = sd(total_macroalgae)/sqrt(n()))
+
+# Time series plot of algae cover over two years 
+ggplot(algae_summary, aes(x = days_since_start, y = mean_algae_cover, color = treatment)) +
+  geom_line() +
+  geom_errorbar(aes(ymax = mean_algae_cover + se_algae_cover,
+                    ymin = mean_algae_cover - se_algae_cover),
+                width = 0.3,
+                color = "black") +
+  geom_point(size = 3,
+             color = "black") +
+  geom_point(size = 2) +
+  labs(x = "Days since manipulation",
+       y = "Percent cover of macroalgae") +
+  scale_y_continuous(limits = c(0,55),
+                     breaks = c(0,10,20,30,40,50)) +
+  scale_x_continuous(breaks = c(0,100,200,300,400,500,600,700)) +
+  scale_color_manual(values = c("#746455", "#b9d5eb"),
+                     name = 'Structure treatment',
+                     labels = c('Dead skeleton', 'Open')) +
+  theme_classic(base_size = 12)
+
+```
+
+```{r Algal cover palatability histogram}
+# Histogram of proportions of palatable vs unpalatable algae at each time point
+preference.hist <- algae_totals %>% 
+  select(-date) %>% 
+  filter(treatment == "Dead coral") %>% 
+  pivot_longer(cols = dictyota:sargassum, names_to = "taxa", values_to = "perc_cover") %>% 
+  select(-c("other", "total_macroalgae")) %>% 
+  filter(taxa != "caulerpa") %>% 
+  mutate(palatability = case_when(taxa == "sargassum" ~ "More preferred",
+                                  taxa == "padina" ~ "More preferred",
+                                  taxa == "filamentous_red" ~ "More preferred",
+                                  taxa == "dictyota" ~ "Less preferred",
+                                  taxa == "turbinaria" ~ "Less preferred",
+                                  taxa == "lobophora" ~ "Less preferred"))
+
+preference.hist.summary <- preference.hist %>% 
+  mutate(days_since_start = as.factor(days_since_start)) %>% 
+  group_by(days_since_start, palatability) %>% 
+  summarize(total_cover = sum(perc_cover)/10)
+
+ggplot(preference.hist.summary, aes(x = days_since_start, y = total_cover, fill = fct_rev(palatability))) +
+  geom_col(color = "black",
+           width = 0.7) +
+  labs(x = "Days since manipulation",
+       y = "Percent cover of macroalgae") +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0,55)) +
+  scale_fill_manual(values = c("white", "black"),
+                    name = "") +
+  theme_classic(base_size = 12)
+
+```
+
+```{r Statistics for macroalgae accummulation}
+
+# Convert time to a categorical variable because there are only 5 time points, and they are not evenly spaced apart; remove initial time point (0 days since manipulation)
+algae_totals.short <- algae_totals %>% 
+  filter(days_since_start != "0") %>% 
+  mutate(days_since_start = as.factor(days_since_start))
+
+# Build generalized linear mixed effects model of proportion of algae cover ~ the interaction of structure treatment and time point (categorical); Patch reef identity is set as a random effect to account for random variation among replicate plots and repeated measures of plots through time; Because macroalgae cover is a percentage, data were converted to a proportion and log(x + 0.001) transformed to handle zeroes in the dataset
+
+algae_cover.glmm <- glmmTMB(log(total_macroalgae.prop + 0.001) ~ treatment*days_since_start + (1|bommie_number),
+               data = algae_totals.short)
+
+Anova(algae_cover.glmm) # model output
+summary(algae_cover.glmm)
+
+hist(residuals(algae_cover.glmm), breaks = 20) # Histogram of residuals
+
+#Gives model predictions on scale of link function
+emmeans.algae_cover <- emmeans(algae_cover.glmm, ~ treatment | days_since_start) 
+
+# Adjusted p-values for pairwise treatment comparisons in each year 
+pairs(emmeans.algae_cover, adjust = "bonferronni", type = "response")
+```
+
+## Coral settlement
+```{r Data loading, cleaning, and statistics}
+
+# Read in recruit density data
+MRB_recruits <- read_csv("Data/Recruit densities_MRB.csv") %>% 
+  clean_names() %>% 
+  #select(-c(2,5,6)) %>% 
+  mutate(log_density = log(recruit_den + 1))
+
+# Check for normality in recruit density and in log(x + 1)-transformed recruit density
+hist(MRB_recruits$recruit_den)
+
+hist(MRB_recruits$log_density) # increased normality
+
+# Run one-way ANOVA of log-transformed  density ~ macroalgae cover level
+MRB_recruits.aov <- aov(log_density ~ macroalgal_cover, data = MRB_recruits)
+summary(MRB_recruits.aov)
+TukeyHSD(MRB_recruits.aov)
+
+
+```
+
+```{r Visualization}
+
+# Create summary table of mean recruit densities 
+MRB_recruits.summary <- MRB_recruits %>% 
+  group_by(macroalgal_cover) %>% 
+  summarize(recruit_density.mean = mean(recruit_den),
+            recruit_density.se = sd(recruit_den)/sqrt(n()),
+            macroalgae.mean = mean(macro_cover2016_2022),
+            macroalgae.se = sd(macro_cover2016_2022)/sqrt(n())) 
+
+
+# Visualization of recruit density ~ macroalgal cover
+ggplot(MRB_recruits.summary, aes(x = macroalgae.mean, y = recruit_density.mean)) +
+  geom_errorbar(aes(xmax = macroalgae.mean + macroalgae.se,
+                    xmin = macroalgae.mean - macroalgae.se),
+                width = 0.1) +
+  geom_errorbar(aes(ymax = recruit_density.mean + recruit_density.se,
+                    ymin = recruit_density.mean - recruit_density.se),
+                width = 1) +
+  geom_point(shape = 15,
+             size = 4) +
+  geom_point(shape = 15,
+             size = 3,
+             color = "#CACFD0") +
+  scale_x_continuous() +
+  scale_y_continuous(limits = c(0,5.5),
+                     expand = c(0,0)) +
+  labs(x = "Macroalgae % cover",
+        y = Recruit~density~(ind/m^2)) +
+  coord_fixed(ratio= 10) +
+  theme_classic(base_size = 15)
+
+```
+
+## Moorea time series analyses
+### Island-wide mean of live coral in 2019
+```{r}
+# Load, clean, and wrangle MCR coral and algae time series
+mcr_coral.2019 <- read_csv("Data/MCR_coral data.csv") %>% 
+  clean_names() %>% 
+  filter(habitat == "Outer 10",
+         taxonomy_substrate_or_functional_group != "Sand", 
+         taxonomy_substrate_or_functional_group != "Soft Coral", 
+         taxonomy_substrate_or_functional_group != "Unknown or Other", 
+         taxonomy_substrate_or_functional_group != "CTB", 
+         taxonomy_substrate_or_functional_group != "Non-coralline Crustose Algae") %>% 
+  mutate(cover_type = case_when(taxonomy_substrate_or_functional_group == "Macroalgae" ~ "Macroalgae",
+                                .default = "Hard coral"),
+         replicate = paste(date, section_of_transect, quadrat_within_section, sep = "_"),
+         percent_cover = as.numeric(percent_cover),
+         cover_type = as.factor(cover_type),
+         date = substr(date, start=1, stop=4))
+
+# Calculate generalized total for coral cover
+mcr_coral.quad_totals.2019 <- mcr_coral.2019 %>% 
+  filter(date == "2019",
+         cover_type == "Hard coral") %>% 
+  group_by(replicate) %>% 
+  summarize(date = first(date),
+            perc_cover = sum(percent_cover))
+
+# Calculate island-wide mean of coral cover 
+mcr_coral.summary.2019 <- mcr_coral.quad_totals.2019 %>% 
+  group_by(date) %>% 
+  summarize(mean_cover = mean(perc_cover)/6)
+
+```
+
+### Analysis of algae before and after cyclone and bleaching disturbances
+```{r Data cleaning and wrangling}
+# Load, clean, and wrangle MCR coral and algae time series
+mcr_coral <- read_csv("Data/MCR_coral data.csv") %>% 
+  clean_names() %>% 
+  filter(site == c("LTER 1", "LTER 2"),
+         habitat == "Outer 10",
+         taxonomy_substrate_or_functional_group != "Sand", 
+         taxonomy_substrate_or_functional_group != "Soft Coral", 
+         taxonomy_substrate_or_functional_group != "Unknown or Other", 
+         taxonomy_substrate_or_functional_group != "CTB", 
+         taxonomy_substrate_or_functional_group != "Non-coralline Crustose Algae") %>% 
+  mutate(cover_type = case_when(taxonomy_substrate_or_functional_group == "Macroalgae" ~ "Macroalgae",
+                                .default = "Hard coral"),
+         replicate = paste(date, section_of_transect, quadrat_within_section, sep = "_"),
+         percent_cover = as.numeric(percent_cover),
+         cover_type = as.factor(cover_type),
+         date = substr(date, start=1, stop=4))
+
+# Calculate generalized totals for coral and algae cover
+mcr_coral.quad_totals <- mcr_coral %>% 
+  group_by(replicate, cover_type) %>% 
+  summarize(date = first(date),
+            perc_cover = sum(percent_cover))
+
+# Calculate means for each year
+mcr_coral.summary <- mcr_coral.quad_totals %>% 
+  group_by(date, cover_type) %>% 
+  summarize(mean_cover = mean(perc_cover),
+            se_cover = sd(perc_cover)/sqrt(n()))
+
+# Load, clean, and wrangle 2023 MCR coral and algae time series
+mcr_coral.2023 <- read_csv("Data/2023_Algae_LTER1_LTER2_Outer10.csv") %>% 
+  clean_names() %>% 
+  filter(taxonomy_substrate_functional_group != "Sand", 
+         taxonomy_substrate_functional_group != "Algal Turf", 
+         taxonomy_substrate_functional_group != "Crustose Corallines", 
+         taxonomy_substrate_functional_group != "Millepora platyphylla", 
+         taxonomy_substrate_functional_group != "Non-coralline Crustose Algae") %>% 
+  mutate(cover_type = case_when(taxonomy_substrate_functional_group == "Coral" ~ "Hard coral",
+                                .default = "Macroalgae"),
+         replicate = paste(date, transect, quadrat, sep = "_"),
+         percent_cover = as.numeric(percent_cover),
+         cover_type = as.factor(cover_type),
+         date = substr(date, start=1, stop=4))
+
+# Calculate generalized totals for coral and algae cover
+mcr_coral.quad_totals.2023 <- mcr_coral.2023 %>% 
+  group_by(year, site, cover_type, replicate) %>% 
+  summarize(date = first(date),
+            perc_cover = sum(percent_cover))
+
+# Calculate means for each year
+mcr_coral.summary.2023 <- mcr_coral.quad_totals.2023 %>% 
+  group_by(year, cover_type) %>% 
+  summarize(mean_cover = mean(perc_cover),
+            se_cover = sd(perc_cover)/sqrt(n())) %>% 
+  rename(date = year) %>% 
+  mutate(date = as.character(date))
+
+# Attach 2023 data to summary table of all years
+mcr_coral.summary <- rbind(mcr_coral.summary, mcr_coral.summary.2023)
+
+# Create individual dataframes of algae cover for 4 years before and after each disturbance type
+algae.before_oli <- mcr_coral.summary %>% 
+  filter(cover_type == "Macroalgae",
+         date == "2006" | date == "2007" | date == "2008" | date ==  "2009") %>% 
+  mutate(dist_period = "Before",
+         dist_type = "Cyclone")
+
+algae.after_oli <- mcr_coral.summary %>% 
+  filter(cover_type == "Macroalgae",
+         date == "2011" | date == "2012" | date == "2013" | date == "2014") %>% 
+  mutate(dist_period = "After",
+         dist_type = "Cyclone")
+
+algae.before_bleaching <- mcr_coral.summary %>% 
+  filter(cover_type == "Macroalgae",
+         date == "2015" | date == "2016" | date == "2017" | date == "2018") %>% 
+  mutate(dist_period = "Before",
+         dist_type = "Bleaching")
+
+algae.after_bleaching <- mcr_coral.summary %>% 
+  filter(cover_type == "Macroalgae",
+         date == "2020" | date == "2021" | date == "2022" | date == "2023") %>%
+  mutate(dist_period = "After",
+         dist_type = "Bleaching")
+
+# merge datasets and create summary table
+algae.before_after <- rbind(algae.before_oli, algae.after_oli, algae.before_bleaching, algae.after_bleaching)
+
+algae.before_after.summary <- algae.before_after %>% 
+  group_by(dist_type, dist_period) %>% 
+  summarize(mean = mean(mean_cover),
+            SE = sd(mean_cover)/sqrt(n())) %>% 
+  mutate(dist_type = as.factor(dist_type)) 
+
+algae.before_after.summary$dist_type <- ordered(algae.before_after.summary$dist_type, levels = c("Cyclone", "Bleaching"))
+
+algae.before_after.summary$dist_period <- ordered(algae.before_after.summary$dist_period, levels = c("Before", "After"))
+
+```
+
+```{r Visualization}
+# Column chart of mean algal cover before and after each disturbance
+ggplot(algae.before_after.summary, aes(x = dist_type, y = mean, fill = dist_period)) +
+  geom_col(position = "dodge",
+           color = "black",
+           width = 0.7) +
+  geom_errorbar(aes(ymax = mean + SE,
+                    ymin = mean - SE),
+                width = 0.1,
+                position = position_dodge(width = 0.7)) +
+  labs(x = "Disturbance type",
+       y = "Percent cover of macroalgae") +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0, 41)) +
+  scale_fill_manual(values = c("#A1B654", "#44781E"),
+                      name = "") +
+  scale_x_discrete(labels = c("Cyclone (2010)",
+                              "Bleaching (2019)")) +
+  theme_classic(base_size = 14)
+
+```
+
+```{r Statistics}
+## Statistical test of algae cover before and after each disturbance type
+# glmmTMB
+algae.before_after <- algae.before_after %>% 
+  mutate(cover_prop = mean_cover/100)
+
+algae.before_after.glmm <- glmmTMB(cover_prop ~ dist_period*dist_type + (1|date),
+                                   family = beta_family(),
+                                   data = algae.before_after)
+Anova(algae.before_after.glmm)
+summary(algae.before_after.glmm)
+
+# Obtain estimated marginal means
+emm <- emmeans(algae.before_after.glmm, ~ dist_period * dist_type)
+
+# Perform pairwise comparisons with Tukey adjustment
+pairwise_comparisons <- contrast(emm, method = "pairwise", adjust = "tukey")
+
+# Summarize the results
+summary(pairwise_comparisons)
+```
+
+## Recruit performance
+```{r Recruit data cleaning and wrangling}
+
+#Load and clean dataframe
+recruits_raw <- read_csv("Data/Beacons recruit performance experiment - Beacons recruit performance_master.csv") %>%
+  clean_names() 
+
+# Remove corals with no final measurements, calculate volume, proportional volume change, and proportional weight change 
+recruits <- recruits_raw %>% 
+  select(-c(2,3,6,19:21)) %>% 
+  filter(treatment != "Cage",
+         treatment != "Cage/Open", # remove caging treatments
+         final_weight_g != "No measurements") %>% # remove corals with no final measurements 
+  mutate(alive_dead = if_else(percent_survival > 5, 1, 0),
+         trial_number = if_else(trial_number == "1", "Immediate recruitment", "Delayed recruitment")) %>% 
+  mutate(final_weight_g = as.numeric(final_weight_g),
+         trial_number = as.factor(trial_number),
+         treatment = case_when(treatment == "Dead coral" ~ "Dead skeletons",
+                               treatment == "Bleached Coral" ~ "Dead skeletons",
+                               treatment == "Open" ~ "Open"), 
+         initial_volume = 2/3*pi*(initial_length_mm/2)*(initial_width_mm/2)*initial_height_mm,
+         final_volume = 2/3*pi*(final_length_mm/2)*(final_width_mm/2)*final_height_mm,
+         vol_change.raw = final_volume - initial_volume,
+         mass_change.raw = final_weight_g - initial_weight_g,
+         volume_change.prop = (final_volume - initial_volume)/initial_volume,
+         mass_change.prop = (final_weight_g - initial_weight_g)/initial_weight_g) 
+
+# To get mean value of initial recruit sizes for main text
+recruits.initial_size <- recruits %>% 
+  summarize(mean.initial_size = mean(initial_length_mm),
+            se.initial_size = sd(initial_length_mm/sqrt(n())))
+
+```
+
+
+```{r}
+# Check that the initial sizes of corals were randomly distributed across bommies and treatments (to ensure no bommie or treatment had especially large or small corals at the start of each experiment/year)
+
+# Split recruit data into different years
+recruits.year_1 <- recruits %>% 
+  filter(trial_number == "Immediate recruitment")
+
+recruits.year_2 <- recruits %>% 
+  filter(trial_number == "Delayed recruitment")
+
+# Two-way ANOVAs of initial coral size ~ bommie and treatment in each year 
+year_1.aov <- aov(initial_volume ~ treatment*bommie_number, data = recruits.year_1)
+summary(year_1.aov)
+
+year_2.aov <- aov(initial_volume ~ treatment*bommie_number, data = recruits.year_2)
+summary(year_2.aov)
+
+```
+
+### Recruit growth
+```{r Recruit growth statistics for Immediate Recruitment}
+
+# Create dataframe for surviving corals in trial (year) 1
+recruits.trial_1 <- recruits %>% 
+  filter(trial_number == "Immediate recruitment",
+         percent_survival > 5,
+         volume_change.prop > 0) %>% 
+  mutate(volume_change.prop.log = log(volume_change.prop),
+         volume_change.prop.sqrt = sqrt(volume_change.prop),
+         mass_change.prop.log = log(mass_change.prop),
+         mass_change.prop.sqrt = sqrt(mass_change.prop))
+
+# Check for normality
+hist(recruits.trial_1$volume_change.prop)
+hist(recruits.trial_1$volume_change.prop.log) # improves normality
+hist(recruits.trial_1$volume_change.prop.sqrt) # improves normality more
+
+hist(recruits.trial_1$mass_change.prop)
+hist(recruits.trial_1$mass_change.prop.log) # improves normality
+hist(recruits.trial_1$mass_change.prop.sqrt) # improves normality more
+
+
+# Mixed effects models for volume change and mass change ~ structure treatment for immediate recruitment
+vol_change.year1.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment + (1|bommie_number),
+                                       data = recruits.trial_1)
+Anova(vol_change.year1.glmm)
+summary(vol_change.year1.glmm)
+
+mass_change.year1.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment + (1|bommie_number),
+                                       data = recruits.trial_1)
+Anova(mass_change.year1.glmm)
+
+# Generate predictions and confidence intervals from model, then turn into data frame
+predictions.vol_change.year1 <- ggpredict(vol_change.year1.glmm, terms = ~treatment)
+plot(predictions.vol_change.year1)
+predictions.vol_change.year1 <- as.data.frame(predictions.vol_change.year1)
+
+predictions.mass_change.year1 <- ggpredict(mass_change.year1.glmm, terms = ~treatment)
+plot(predictions.mass_change.year1)
+predictions.mass_change.year1 <- as.data.frame(predictions.mass_change.year1)
+```
+
+```{r Recruit growth statistics for Delayed Recruitment}
+
+# Create dataframe for surviving corals in trial (year) 2
+recruits.trial_2 <- recruits %>% 
+  filter(trial_number == "Delayed recruitment",
+         percent_survival > 5,
+         volume_change.prop > 0) %>% 
+  mutate(volume_change.prop.log = log(volume_change.prop),
+         volume_change.prop.sqrt = sqrt(volume_change.prop),
+         mass_change.prop.log = log(mass_change.prop),
+         mass_change.prop.sqrt = sqrt(mass_change.prop))
+
+# Check for normality
+hist(recruits.trial_2$volume_change.prop)
+hist(recruits.trial_2$volume_change.prop.log) # improves normality
+hist(recruits.trial_2$volume_change.prop.sqrt) # improves normality most
+
+hist(recruits.trial_2$mass_change.prop)
+hist(recruits.trial_2$mass_change.prop.log) # improves normality
+hist(recruits.trial_2$mass_change.prop.sqrt) # improves normality most
+
+# Mixed effects models for volume change and mass change ~ structure treatment for delayed recruitment
+vol_change.year2.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment + (1|bommie_number),
+                                       data = recruits.trial_2)
+Anova(vol_change.year2.glmm)
+
+mass_change.year2.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment + (1|bommie_number),
+                                       data = recruits.trial_2)
+Anova(mass_change.year2.glmm)
+
+# Generate predictions and confidence intervals from model, then turn into data frame
+predictions.vol_change.year2 <- ggpredict(vol_change.year2.glmm, terms = ~treatment)
+plot(predictions.vol_change.year2)
+predictions.vol_change.year2 <- as.data.frame(predictions.vol_change.year2)
+
+predictions.mass_change.year2 <- ggpredict(mass_change.year2.glmm, terms = ~treatment)
+plot(predictions.mass_change.year2)
+predictions.mass_change.year2 <- as.data.frame(predictions.mass_change.year2)
+```
+
+```{r Visualizations for volume and mass change in coral recruits}
+
+## Volume change
+# Create combined dataset for both years
+predictions.vol_change.year1 <- predictions.vol_change.year1 %>% 
+  mutate(recruitment_period = "Immediate recruitment")
+
+predictions.vol_change.year2 <- predictions.vol_change.year2 %>% 
+  mutate(recruitment_period = "Delayed recruitment")
+
+recruitment_trials.volume <- rbind(predictions.vol_change.year1, predictions.vol_change.year2) 
+
+# Back-transform means and SE's
+recruitment_trials.volume <- recruitment_trials.volume %>% 
+  mutate(predicted.back_trans = predicted^2,
+         std.error.back_trans = 2*predicted*std.error) # Back-transformed SE's using Delta method
+
+# Recruit volume change ~ structure treatment and trial period
+recruitment_trials.volume$recruitment_period <- ordered(recruitment_trials.volume$recruitment_period, levels = c("Immediate recruitment", "Delayed recruitment"))
+
+# Back transformed means and SE's
+ggplot(recruitment_trials.volume, aes(x = x, y = predicted.back_trans, color = x))+
+  geom_errorbar(aes(ymin = predicted.back_trans - std.error.back_trans, 
+                    ymax = predicted.back_trans + std.error.back_trans),
+                width = 0,
+                color = "black")+
+  geom_point(aes(x = x, y = predicted.back_trans),
+             size = 3,
+             color = "black")+
+  geom_point(aes(x = x, y = predicted.back_trans, color = x),
+             size = 2) +
+  labs(x = "Structure treatment",
+       y = "Proportional change in volume") +
+  scale_color_manual(values = c("#746455", "#b9d5eb", "#746455", "#b9d5eb"),
+                     name = 'Structure treatment',
+                     labels = c('Dead skeleton', 'Open', 'Dead skeleton', 'Open')) +
+  facet_wrap(~recruitment_period) +
+  theme_classic(base_size = 12)
+
+## Mass change
+# Create combined dataset for both years
+predictions.mass_change.year1 <- predictions.mass_change.year1 %>% 
+  mutate(recruitment_period = "Immediate recruitment")
+
+predictions.mass_change.year2 <- predictions.mass_change.year2 %>% 
+  mutate(recruitment_period = "Delayed recruitment")
+
+recruitment_trials.mass <- rbind(predictions.mass_change.year1, predictions.mass_change.year2)
+
+# Recruit mass change ~ structure treatment and trial period
+recruitment_trials.mass$recruitment_period <- ordered(recruitment_trials.mass$recruitment_period, levels = c("Immediate recruitment", "Delayed recruitment"))
+
+ggplot(recruitment_trials.mass, aes(x = x, y = predicted, color = x))+
+  geom_errorbar(aes(x = x, y = predicted, 
+                    ymin =conf.low, ymax = conf.high),
+                width = 0,
+                color = "black")+
+  geom_point(aes(x = x, y = predicted),
+             size = 3,
+             color = "black")+
+  geom_point(aes(x = x, y = predicted, color = x),
+             size = 2) +
+  labs(x = "Structure treatment",
+       y = "Proportional change in mass") +
+  scale_color_manual(values = c("#746455", "#b9d5eb", "#746455", "#b9d5eb"),
+                     name = 'Structure treatment',
+                     labels = c('Dead skeleton', 'Open', 'Dead skeleton', 'Open')) +
+  facet_wrap(~recruitment_period) +
+  theme_classic(base_size = 12)
+```
+
+### Recruit mortality
+
+```{r Data cleaning and visualization for recruit mortality}
+
+# Number of corals that underwent whole colony mortality
+recruit_mortality <- recruits %>% 
+  select(-c(2,4:8,10:16,17:21)) %>% 
+  filter(percent_survival <= 5) %>% 
+  mutate(mortality_type = case_when(volume_change.prop > 0 ~ "Dead in place",
+                                    volume_change.prop < 0 ~ "Removal")) 
+
+recruit_mortality.summary <- recruit_mortality %>% 
+  group_by(trial_number, treatment, mortality_type) %>% 
+  summarize(number_dead = n())
+
+total_mortality.count <- c(12,12,13,13,28,28,28,28)
+total_mortality.count = as.data.frame(total_mortality.count)
+
+recruit_mortality.summary <- cbind(recruit_mortality.summary, total_mortality.count)
+
+recruit_mortality.prop <- recruit_mortality.summary %>% 
+  mutate(prop_dead = number_dead/total_mortality.count)
+
+# Visualization of coral mortality
+ggplot(recruit_mortality.prop, aes(x = treatment, y = prop_dead, fill = fct_rev(mortality_type))) +
+  geom_col(width = 0.5,
+           color = "black") +
+  labs(x = "Structure treatment",
+       y = "Proportion of dead colonies") +
+  scale_fill_manual(values = c("grey", "black"),
+                    name = "Mortality type",
+                    labels = c("Removal", "Dead in place")) +
+  facet_wrap(~fct_rev(trial_number)) +
+  scale_y_continuous(expand = c(0,0),
+                     limits = c(0,1.1), 
+                     breaks = c(0.0,0.2,0.4,0.6,0.8,1.0)) +
+  theme_classic(base_size = 12)
+```
+
+```{r Statistics for recruit mortality}
+# Contingency table for immediate recruitment
+contingency.immediate <- recruit_mortality.summary %>% 
+  filter(trial_number == "Immediate recruitment") %>% 
+  select(-c(trial_number,total_mortality.count)) 
+
+matrix.immediate <- matrix(contingency.immediate$number_dead, ncol = 2, nrow = 2)
+rownames(matrix.immediate) <- c("Dead in place", "Removal")
+colnames(matrix.immediate) <- c("Dead skeletons", "Open")
+
+chisq.test(matrix.immediate)$expected # Check expected frequencies; all expected values above 5, Chi-square test appropriate 
+chi.immediate <- chisq.test(matrix.immediate)
+
+# Contingency table for delayed recruitment
+contingency.delayed <- recruit_mortality.summary %>% 
+  filter(trial_number == "Delayed recruitment") %>% 
+  select(-c(trial_number,total_mortality.count)) 
+
+matrix.delayed <- matrix(contingency.delayed$number_dead, ncol = 2, nrow = 2)
+rownames(matrix.delayed) <- c("Dead in place", "Removal")
+colnames(matrix.delayed) <- c("Dead skeletons", "Open")
+
+# Chi-square and Fisher's exact test for mortality type ~ structure treatment for delayed recruitment experiment
+chi.delayed <- chisq.test(matrix.delayed) # Gives warning that Chi-square test may be incorrect
+chisq.test(matrix.delayed)$expected # Shows that two expected frequencies are below 5; should use Fisher's exact test instead
+fisher.delayed <- fisher_test(matrix.delayed)
+
+```
