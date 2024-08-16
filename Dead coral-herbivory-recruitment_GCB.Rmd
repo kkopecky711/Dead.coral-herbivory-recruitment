@@ -274,12 +274,17 @@ ggplot(preference.hist.summary, aes(x = days_since_start, y = total_cover, fill 
 # Convert time to a categorical variable because there are only 5 time points, and they are not evenly spaced apart; remove initial time point (0 days since manipulation)
 algae_totals.short <- algae_totals %>% 
   filter(days_since_start != "0") %>% 
-  mutate(days_since_start = as.factor(days_since_start))
+  mutate(days_since_start = as.factor(days_since_start),
+         prop_const = total_macroalgae.prop + 0.001,
+         log_trans.prop = log(prop_const))
+
+hist(algae_totals.short$log_trans.prop)
 
 # Build generalized linear mixed effects model of proportion of algae cover ~ the interaction of structure treatment and time point (categorical); Patch reef identity is set as a random effect to account for random variation among replicate plots and repeated measures of plots through time; Because macroalgae cover is a percentage, data were converted to a proportion and log(x + 0.001) transformed to handle zeroes in the dataset
 
-algae_cover.glmm <- glmmTMB(log(total_macroalgae.prop + 0.001) ~ treatment*days_since_start + (1|bommie_number),
-               data = algae_totals.short)
+algae_cover.glmm <- glmmTMB(prop_const ~ treatment*days_since_start + (1|bommie_number), 
+                            family = beta_family(),
+                            data = algae_totals.short)
 
 Anova(algae_cover.glmm) # model output
 summary(algae_cover.glmm)
@@ -404,12 +409,27 @@ mcr_coral <- read_csv("Data/MCR_coral data.csv") %>%
 
 # Calculate generalized totals for coral and algae cover
 mcr_coral.quad_totals <- mcr_coral %>% 
-  group_by(replicate, cover_type) %>% 
+  group_by(date, location, cover_type) %>% 
   summarize(date = first(date),
             perc_cover = sum(percent_cover))
 
+# Create all possible combinations
+all_combinations <- expand.grid(
+  date = unique(mcr_coral.quad_totals$date),
+  location = unique(mcr_coral.quad_totals$location),
+  cover_type = unique(mcr_coral.quad_totals$cover_type))
+
+# Merge with original data and fill missing values with 0
+mcr_coral.quad_totals.complete <- all_combinations %>%
+  left_join(mcr_coral.quad_totals, by = c("date", "location", "cover_type")) %>%
+  mutate(perc_cover = replace_na(perc_cover, 0))
+
+mcr_coral.quad_totals.counts <- mcr_coral.quad_totals.complete %>% 
+  group_by(date, cover_type) %>% 
+  summarize(reps = n())
+
 # Calculate means for each year
-mcr_coral.summary <- mcr_coral.quad_totals %>% 
+mcr_coral.summary <- mcr_coral.quad_totals.complete %>% 
   group_by(date, cover_type) %>% 
   summarize(mean_cover = mean(perc_cover),
             se_cover = sd(perc_cover)/sqrt(n()))
@@ -431,8 +451,8 @@ mcr_coral.2023 <- read_csv("Data/2023_Algae_LTER1_LTER2_Outer10.csv") %>%
 
 # Calculate generalized totals for coral and algae cover
 mcr_coral.quad_totals.2023 <- mcr_coral.2023 %>% 
-  group_by(year, site, cover_type, replicate) %>% 
-  summarize(date = first(date),
+  group_by(year, location, cover_type) %>% 
+  summarize(#date = first(date),
             perc_cover = sum(percent_cover))
 
 # Calculate means for each year
@@ -445,6 +465,7 @@ mcr_coral.summary.2023 <- mcr_coral.quad_totals.2023 %>%
 
 # Attach 2023 data to summary table of all years
 mcr_coral.summary <- rbind(mcr_coral.summary, mcr_coral.summary.2023)
+write_csv(mcr_coral.summary, "mcr.coral_algae_means.2005-2023.csv")
 
 # Create individual dataframes of algae cover for 4 years before and after each disturbance type
 algae.before_oli <- mcr_coral.summary %>% 
@@ -486,6 +507,73 @@ algae.before_after.summary$dist_period <- ordered(algae.before_after.summary$dis
 
 ```
 
+```{r Macroalgae cover before and after disturbances}
+
+# Read in and clean MCR algae data
+mcr_algae <- read_csv("Data/MCR_LTER_Annual_Survey_Benthic_Cover_20231211.csv") %>% 
+  clean_names() %>% 
+  filter(site == c("LTER 1", "LTER 2"),
+         habitat == "Outer 10",
+         taxonomy_substrate_functional_group != "Sand", 
+         taxonomy_substrate_functional_group != "Algal Turf", 
+         taxonomy_substrate_functional_group != "Crustose Corallines", 
+         taxonomy_substrate_functional_group != "Millepora platyphylla", 
+         taxonomy_substrate_functional_group != "Non-coralline Crustose Algae",
+         taxonomy_substrate_functional_group != "Sponge",
+         taxonomy_substrate_functional_group != "Cyanophyta",
+         taxonomy_substrate_functional_group != "Coral")
+
+# Calculate quadrat totals
+mcr_algae.quads <- mcr_algae %>% 
+  group_by(year, location) %>% 
+  summarize(perc_cover = sum(percent_cover))
+
+mcr_algae.quads.n <- mcr_algae.quads %>% 
+  summarize(n = n())
+
+# Summarize algae cover by year
+mcr_algae.summary <- mcr_algae.quads %>% 
+  mutate(year = as.character(year)) %>% 
+  group_by(year) %>% 
+  summarize(perc_cover.mean = mean(perc_cover),
+            perc_cover.se = sd(perc_cover)/sqrt(n()))
+
+# Create individual dataframes of algae cover for 4 years before and after each disturbance type
+algae.before_oli <- mcr_algae.summary %>% 
+  filter(year == "2005" | year == "2007" | year == "2008" | year ==  "2009") %>% 
+  mutate(dist_period = "Before",
+         dist_type = "Cyclone")
+
+algae.after_oli <- mcr_algae.summary %>% 
+  filter(year == "2011" | year == "2012" | year == "2013" | year == "2014") %>% 
+  mutate(dist_period = "After",
+         dist_type = "Cyclone")
+
+algae.before_bleaching <- mcr_algae.summary %>% 
+  filter(year == "2015" | year == "2016" | year == "2017" | year == "2018") %>% 
+  mutate(dist_period = "Before",
+         dist_type = "Bleaching")
+
+algae.after_bleaching <- mcr_algae.summary %>% 
+  filter(year == "2020" | year == "2022" | year == "2023") %>%
+  mutate(dist_period = "After",
+         dist_type = "Bleaching")
+
+# merge datasets and create summary table
+algae.before_after <- rbind(algae.before_oli, algae.after_oli, algae.before_bleaching, algae.after_bleaching)
+
+algae.before_after.summary <- algae.before_after %>% 
+  group_by(dist_type, dist_period) %>% 
+  summarize(mean = mean(perc_cover.mean),
+            SE = sd(perc_cover.mean)/sqrt(n())) %>% 
+  mutate(dist_type = as.factor(dist_type)) 
+
+algae.before_after.summary$dist_type <- ordered(algae.before_after.summary$dist_type, levels = c("Cyclone", "Bleaching"))
+
+algae.before_after.summary$dist_period <- ordered(algae.before_after.summary$dist_period, levels = c("Before", "After"))
+
+```
+
 ```{r Visualization}
 # Column chart of mean algal cover before and after each disturbance
 ggplot(algae.before_after.summary, aes(x = dist_type, y = mean, fill = dist_period)) +
@@ -512,10 +600,10 @@ ggplot(algae.before_after.summary, aes(x = dist_type, y = mean, fill = dist_peri
 ## Statistical test of algae cover before and after each disturbance type
 # glmmTMB
 algae.before_after <- algae.before_after %>% 
-  mutate(cover_prop = mean_cover/100)
+  mutate(cover_prop = perc_cover.mean/100)
 
-algae.before_after.glmm <- glmmTMB(cover_prop ~ dist_period*dist_type + (1|date),
-                                   family = beta_family(),
+algae.before_after.glmm <- glmmTMB(cover_prop ~ dist_period*dist_type + (1|year),
+                                   family = beta_family(link = "logit"),
                                    data = algae.before_after)
 Anova(algae.before_after.glmm)
 summary(algae.before_after.glmm)
@@ -530,10 +618,10 @@ pairwise_comparisons <- contrast(emm, method = "pairwise", adjust = "tukey")
 summary(pairwise_comparisons)
 ```
 
-## Recruit performance
+## Recruit performance analyses
 ```{r Recruit data cleaning and wrangling}
 
-#Load and clean dataframe
+#Load and clean dataframe for coral recruits
 recruits_raw <- read_csv("Data/Beacons recruit performance experiment - Beacons recruit performance_master.csv") %>%
   clean_names() 
 
@@ -607,13 +695,19 @@ hist(recruits.trial_1$mass_change.prop.log) # improves normality
 hist(recruits.trial_1$mass_change.prop.sqrt) # improves normality more
 
 
+# Summary table of number of survivors to check if patch reef can be specified as a random effect
+recruits.trial_1.summary <- recruits.trial_1 %>% 
+  group_by(bommie_number) %>% 
+  summarize(num_survivors = n())
+
 # Mixed effects models for volume change and mass change ~ structure treatment for immediate recruitment
-vol_change.year1.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment + (1|bommie_number),
+
+vol_change.year1.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment,
                                        data = recruits.trial_1)
 Anova(vol_change.year1.glmm)
 summary(vol_change.year1.glmm)
 
-mass_change.year1.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment + (1|bommie_number),
+mass_change.year1.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment,
                                        data = recruits.trial_1)
 Anova(mass_change.year1.glmm)
 
@@ -649,11 +743,11 @@ hist(recruits.trial_2$mass_change.prop.log) # improves normality
 hist(recruits.trial_2$mass_change.prop.sqrt) # improves normality most
 
 # Mixed effects models for volume change and mass change ~ structure treatment for delayed recruitment
-vol_change.year2.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment + (1|bommie_number),
+vol_change.year2.glmm <- glmmTMB(volume_change.prop.sqrt ~ treatment,
                                        data = recruits.trial_2)
 Anova(vol_change.year2.glmm)
 
-mass_change.year2.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment + (1|bommie_number),
+mass_change.year2.glmm <- glmmTMB(mass_change.prop.sqrt ~ treatment,
                                        data = recruits.trial_2)
 Anova(mass_change.year2.glmm)
 
